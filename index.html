@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Game Rules Generator & Referee</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "idb-keyval": "https://cdn.jsdelivr.net/npm/idb-keyval@6/dist/idb-keyval.mjs"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <header class="app-header">
+      <h1>Game Rules Generator + Voice Referee</h1>
+      <div class="header-actions">
+        <button id="exportBtn" title="Export all saved games">Export</button>
+        <label class="import-label">
+          Import
+          <input id="importInput" type="file" accept="application/json" hidden />
+        </label>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel rules-panel">
+        <h2>1) Describe Your Game</h2>
+        <label class="field">
+          <span>Game Name</span>
+          <input id="gameName" type="text" placeholder="e.g., Space Traders Deluxe" />
+        </label>
+
+        <label class="field">
+          <span>Rules Description (speak or type)</span>
+          <textarea
+            id="rulesInput"
+            rows="10"
+            placeholder="Describe setup, turn order, scoring, fouls, win conditions, edge cases..."
+          ></textarea>
+        </label>
+
+        <div class="mic-row">
+          <button id="micRulesBtn" class="mic-btn" title="Speak rules">
+            🎤 Speak Rules
+          </button>
+          <span id="micRulesStatus" class="mic-status">Idle</span>
+        </div>
+
+        <div class="actions">
+          <button id="summarizeBtn">Summarize & Validate</button>
+          <button id="clearRulesBtn" class="secondary">Clear</button>
+        </div>
+
+        <div id="summaryContainer" class="summary hidden">
+          <h3>Proposed Rules Summary (AI)</h3>
+          <pre id="summaryPreview"></pre>
+          <div class="actions">
+            <button id="saveRulesBtn" class="primary">Save to Memory</button>
+          </div>
+        </div>
+
+        <hr />
+
+        <h3>Saved Games</h3>
+        <div class="saved-row">
+          <select id="gamesSelect"></select>
+          <button id="deleteGameBtn" class="danger">Delete</button>
+        </div>
+      </section>
+
+      <section class="panel chat-panel">
+        <h2>2) Ask the Referee</h2>
+        <div class="status-row">
+          <div>
+            Active Game:
+            <strong id="activeGameName">None selected</strong>
+          </div>
+          <label class="switch">
+            <input id="ttsToggle" type="checkbox" checked />
+            <span>Speak replies</span>
+          </label>
+        </div>
+
+        <div id="chatLog" class="chat-log"></div>
+
+        <div class="chat-controls">
+          <textarea id="chatInput" rows="2" placeholder="Ask about a move, dispute, scoring, or rule interpretation..."></textarea>
+          <div class="chat-actions">
+            <button id="micChatBtn" class="mic-btn">🎤 Ask by Voice</button>
+            <span id="micChatStatus" class="mic-status">Idle</span>
+            <button id="sendBtn" class="primary">Send</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      Tip: First, describe your game fully and save. Then select it and chat with the AI referee.
+    </footer>
+
+    <script src="app.js" type="module"></script>
+  <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
+</body>
+</html>
+
