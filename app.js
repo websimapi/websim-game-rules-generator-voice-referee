@@ -33,6 +33,20 @@ const importInput = document.getElementById("importInput");
 const handsFreeBtn = document.getElementById("handsFreeBtn");
 const handsFreeStatus = document.getElementById("handsFreeStatus");
 
+// New mobile/PTT UI
+const pttRow = document.getElementById("pttRow");
+const pttBtn = document.getElementById("pttBtn");
+const pttStatus = document.getElementById("pttStatus");
+const srSupportBanner = document.getElementById("srSupportBanner");
+const srSupportText = document.getElementById("srSupportText");
+const quickCommands = document.getElementById("quickCommands");
+
+// Env detection
+const ua = navigator.userAgent || "";
+const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isAndroid = /Android/i.test(ua);
+const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(ua);
+
 // Conversation state
 let conversationHistory = []; // [{ role, content }]
 let activeGameId = null;
@@ -47,11 +61,29 @@ const hasSpeechRecognition = !!SpeechRecognition;
 let handsFreeActive = false;
 let handsFreeRecognizer = null;
 let suppressRecognizer = false; // pause listening while TTS is speaking
+let pttRecognizer = null;
+let pttActive = false;
+
+// Prime audio on first interaction (helps mobile autoplay policies)
+let audioPrimed = false;
+function primeAudio() {
+  if (audioPrimed) return;
+  audioPrimed = true;
+  try {
+    // Some browsers require resume() after a user gesture
+    if (window.speechSynthesis?.paused) window.speechSynthesis.resume();
+    // A no-op utterance to unlock
+    const u = new SpeechSynthesisUtterance("");
+    window.speechSynthesis.speak(u);
+    window.speechSynthesis.cancel();
+  } catch (_) {}
+}
 
 // TTS helper
 function speak(text) {
   if (!ttsToggle.checked) return;
   if (!("speechSynthesis" in window)) return;
+  primeAudio();
   // Cancel any ongoing speech
   window.speechSynthesis.cancel();
   const utter = new SpeechSynthesisUtterance(text);
@@ -61,6 +93,7 @@ function speak(text) {
 }
 async function speakAsync(text) {
   if (!ttsToggle.checked || !("speechSynthesis" in window) || !text) return;
+  primeAudio();
   // Temporarily pause hands-free recognizer to avoid self-hearing
   const wasActive = handsFreeActive && handsFreeRecognizer;
   if (wasActive) {
@@ -78,7 +111,7 @@ async function speakAsync(text) {
   });
   if (wasActive) {
     // Give the browser a brief moment before restarting recognition
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 200));
     suppressRecognizer = false;
     try { handsFreeRecognizer.start(); } catch (_) {}
   }
@@ -371,7 +404,7 @@ function startContinuousDictation(targetEl, statusEl) {
   rec.onend = () => {
     statusEl.textContent = "Idle";
     if (listening) {
-      // auto-restart for continuous capture
+      // auto-restart for continuous capture (Android Chrome friendly)
       try {
         rec.start();
       } catch (_) {}
@@ -391,7 +424,7 @@ function startContinuousDictation(targetEl, statusEl) {
     statusEl.textContent = interim ? `Listening… (${interim})` : "Listening…";
   };
 
-  rec.start();
+  try { rec.start(); } catch (_) {}
 
   return () => {
     listening = false;
@@ -399,6 +432,63 @@ function startContinuousDictation(targetEl, statusEl) {
       rec.stop();
     } catch (_) {}
   };
+}
+
+// Push-to-talk (single utterance) recognition for mobile
+function createPTTRecognizer() {
+  if (!hasSpeechRecognition) return null;
+  const rec = new SpeechRecognition();
+  rec.lang = "en-US";
+  rec.continuous = false; // single utterance
+  rec.interimResults = true;
+
+  rec.onstart = () => {
+    pttStatus.textContent = "Listening…";
+    pttBtn.classList.add("recording");
+  };
+  rec.onerror = (e) => {
+    pttStatus.textContent = `Error: ${e.error}`;
+    pttBtn.classList.remove("recording");
+    pttActive = false;
+  };
+  rec.onend = () => {
+    if (!pttActive) {
+      pttStatus.textContent = "Press and hold, then release to send";
+      pttBtn.classList.remove("recording");
+    }
+  };
+  rec.onresult = async (event) => {
+    let interim = "";
+    let finalHeard = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const res = event.results[i];
+      if (res.isFinal) {
+        finalHeard += res[0].transcript;
+      } else {
+        interim += res[0].transcript;
+      }
+    }
+    if (interim) {
+      pttStatus.textContent = `Listening… (${interim})`;
+    }
+    if (finalHeard.trim()) {
+      renderMsg("user", finalHeard.trim());
+      // Resolve any follow-ups or route
+      const handled = await resolvePendingFollowup(finalHeard.trim());
+      if (!handled) {
+        const state = await fillSavedGamesInState(getStateSnapshot());
+        try {
+          const route = await routeVoiceCommand(finalHeard.trim(), state);
+          await handleRoutedAction(route);
+        } catch (err) {
+          console.error(err);
+          await speakAsync("I had trouble understanding that. Please try again.");
+        }
+      }
+    }
+  };
+
+  return rec;
 }
 
 // LLM router to interpret voice commands into actions (JSON-only)
@@ -633,7 +723,9 @@ async function resolvePendingFollowup(text) {
 // Hands-free continuous listener
 function startHandsFree() {
   if (!hasSpeechRecognition) {
-    alert("Speech recognition is not supported in this browser.");
+    // Fall back to PTT guidance
+    handsFreeStatus.textContent = "Speech recognition not available.";
+    srSupportBanner.classList.remove("hidden");
     return;
   }
   if (handsFreeActive) return;
@@ -643,7 +735,8 @@ function startHandsFree() {
   handsFreeStatus.textContent = "Listening…";
   handsFreeRecognizer = new SpeechRecognition();
   handsFreeRecognizer.lang = "en-US";
-  handsFreeRecognizer.continuous = true;
+  // On mobile, continuous can be unreliable; use continuous on Android only
+  handsFreeRecognizer.continuous = isAndroid;
   handsFreeRecognizer.interimResults = true;
 
   let interim = "";
@@ -656,6 +749,7 @@ function startHandsFree() {
   handsFreeRecognizer.onend = () => {
     if (!handsFreeActive) return;
     if (!suppressRecognizer) {
+      // For non-continuous (iOS not supported anyway) or if Android drops, restart
       handsFreeStatus.textContent = "Reconnecting…";
       try { handsFreeRecognizer.start(); } catch (_) {}
     }
@@ -757,11 +851,13 @@ gamesSelect.addEventListener("change", (e) => setActiveGame(e.target.value));
 deleteGameBtn.addEventListener("click", deleteActiveGame);
 
 sendBtn.addEventListener("click", async () => {
+  primeAudio();
   const txt = chatInputEl.value.trim();
   chatInputEl.value = "";
   await sendChat(txt);
 });
 chatInputEl.addEventListener("keydown", async (e) => {
+  // On mobile, Enter inserts newline; use Ctrl/Cmd+Enter to send as before
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
     const txt = chatInputEl.value.trim();
     chatInputEl.value = "";
@@ -769,9 +865,37 @@ chatInputEl.addEventListener("keydown", async (e) => {
   }
 });
 
+// Quick command chips (mobile friendly)
+quickCommands.addEventListener("click", async (e) => {
+  const btn = e.target.closest("button[data-cmd]");
+  if (!btn) return;
+  const cmd = btn.dataset.cmd;
+  if (cmd === "stop") {
+    stopHandsFree();
+    await speakAsync("Hands-free mode stopped.");
+    return;
+  }
+  const mapToIntent = {
+    help: "help",
+    summarize_rules: "summarize_rules",
+    save_rules: "save_rules",
+    export: "export",
+  };
+  const intent = mapToIntent[cmd];
+  if (intent) {
+    const state = await fillSavedGamesInState(getStateSnapshot());
+    await handleRoutedAction({ intent, slots: {}, say: "" }, state);
+  }
+});
+
 // Mic buttons
 let stopRulesMic = null;
 micRulesBtn.addEventListener("click", () => {
+  primeAudio();
+  if (!hasSpeechRecognition) {
+    alert("Speech recognition is not supported in this browser.");
+    return;
+  }
   if (stopRulesMic) {
     stopRulesMic();
     stopRulesMic = null;
@@ -787,6 +911,11 @@ micRulesBtn.addEventListener("click", () => {
 
 let stopChatMic = null;
 micChatBtn.addEventListener("click", () => {
+  primeAudio();
+  if (!hasSpeechRecognition) {
+    alert("Speech recognition is not supported in this browser.");
+    return;
+  }
   if (stopChatMic) {
     stopChatMic();
     stopChatMic = null;
@@ -811,6 +940,7 @@ importInput.addEventListener("change", async (e) => {
 
 // Hands-free button
 handsFreeBtn.addEventListener("click", () => {
+  primeAudio();
   if (handsFreeActive) {
     stopHandsFree();
   } else {
@@ -818,8 +948,46 @@ handsFreeBtn.addEventListener("click", () => {
   }
 });
 
+// Push-to-talk bindings (mobile)
+function bindPTT() {
+  if (!hasSpeechRecognition) return;
+  if (!pttBtn) return;
+  const startPTT = () => {
+    primeAudio();
+    if (pttActive) return;
+    pttActive = true;
+    if (!pttRecognizer) pttRecognizer = createPTTRecognizer();
+    try { pttRecognizer.start(); } catch (_) {}
+  };
+  const stopPTT = () => {
+    if (!pttActive) return;
+    pttActive = false;
+    try { pttRecognizer.stop(); } catch (_) {}
+    pttBtn.classList.remove("recording");
+  };
+  // Mouse + touch (passive false so we can preventDefault to avoid long-press menus)
+  pttBtn.addEventListener("mousedown", (e) => { e.preventDefault(); startPTT(); });
+  pttBtn.addEventListener("mouseup", (e) => { e.preventDefault(); stopPTT(); });
+  pttBtn.addEventListener("mouseleave", (e) => { e.preventDefault(); stopPTT(); });
+  pttBtn.addEventListener("touchstart", (e) => { e.preventDefault(); startPTT(); }, { passive: false });
+  pttBtn.addEventListener("touchend", (e) => { e.preventDefault(); stopPTT(); }, { passive: false });
+  pttBtn.addEventListener("touchcancel", (e) => { e.preventDefault(); stopPTT(); }, { passive: false });
+}
+
 // Initialize
 (async function init() {
+  // Show support banner and PTT where appropriate
+  if (!hasSpeechRecognition) {
+    srSupportText.textContent = isIOS
+      ? "iOS Safari does not provide speech recognition. You can still use text chat and voice replies."
+      : "This browser does not provide speech recognition. You can still use text chat and voice replies.";
+    srSupportBanner.classList.remove("hidden");
+  } else if (isMobile) {
+    // Mobile has SR: show PTT option (more reliable for mobile)
+    pttRow.classList.remove("hidden");
+    bindPTT();
+  }
+
   await refreshGamesList();
   // Autoselect last game on load handled in refreshGamesList
   renderMsg(

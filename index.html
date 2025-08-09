@@ -76,6 +76,12 @@
 
       <section class="panel chat-panel">
         <h2>2) Ask the Referee</h2>
+
+        <div id="srSupportBanner" class="support-banner hidden">
+          <strong>Note:</strong>
+          <span id="srSupportText">Your browser may have limited speech recognition support.</span>
+        </div>
+
         <div class="status-row">
           <div>
             Active Game:
@@ -94,9 +100,24 @@
           <span id="handsFreeStatus" class="mic-status">Idle</span>
         </div>
 
+        <div id="pttRow" class="ptt-row hidden">
+          <button id="pttBtn" class="ptt-btn" title="Press and hold to speak">
+            Hold to Talk
+          </button>
+          <span id="pttStatus" class="mic-status">Press and hold, then release to send</span>
+        </div>
+
+        <div id="quickCommands" class="quick-commands">
+          <button data-cmd="help" class="chip">Help</button>
+          <button data-cmd="summarize_rules" class="chip">Summarize</button>
+          <button data-cmd="save_rules" class="chip">Save</button>
+          <button data-cmd="export" class="chip">Export</button>
+          <button data-cmd="stop" class="chip danger-chip">Stop HF</button>
+        </div>
+
         <div id="chatLog" class="chat-log"></div>
 
-        <div class="chat-controls">
+        <div class="chat-controls sticky-bottom">
           <textarea id="chatInput" rows="2" placeholder="Ask about a move, dispute, scoring, or rule interpretation..."></textarea>
           <div class="chat-actions">
             <button id="micChatBtn" class="mic-btn">🎤 Ask by Voice</button>
