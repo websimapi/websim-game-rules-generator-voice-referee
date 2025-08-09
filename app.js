@@ -29,6 +29,10 @@ const ttsToggle = document.getElementById("ttsToggle");
 const exportBtn = document.getElementById("exportBtn");
 const importInput = document.getElementById("importInput");
 
+// Hands-free UI
+const handsFreeBtn = document.getElementById("handsFreeBtn");
+const handsFreeStatus = document.getElementById("handsFreeStatus");
+
 // Conversation state
 let conversationHistory = []; // [{ role, content }]
 let activeGameId = null;
@@ -39,6 +43,11 @@ const SpeechRecognition =
   window.SpeechRecognition || window.webkitSpeechRecognition;
 const hasSpeechRecognition = !!SpeechRecognition;
 
+// Hands-free state
+let handsFreeActive = false;
+let handsFreeRecognizer = null;
+let suppressRecognizer = false; // pause listening while TTS is speaking
+
 // TTS helper
 function speak(text) {
   if (!ttsToggle.checked) return;
@@ -46,10 +55,33 @@ function speak(text) {
   // Cancel any ongoing speech
   window.speechSynthesis.cancel();
   const utter = new SpeechSynthesisUtterance(text);
-  // Use device default voice; users can change in system settings
   utter.rate = 1.0;
   utter.pitch = 1.0;
   window.speechSynthesis.speak(utter);
+}
+async function speakAsync(text) {
+  if (!ttsToggle.checked || !("speechSynthesis" in window) || !text) return;
+  // Temporarily pause hands-free recognizer to avoid self-hearing
+  const wasActive = handsFreeActive && handsFreeRecognizer;
+  if (wasActive) {
+    suppressRecognizer = true;
+    try { handsFreeRecognizer.stop(); } catch (_) {}
+  }
+  await new Promise((resolve) => {
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = 1.0;
+    utter.pitch = 1.0;
+    utter.onend = resolve;
+    utter.onerror = resolve;
+    window.speechSynthesis.speak(utter);
+  });
+  if (wasActive) {
+    // Give the browser a brief moment before restarting recognition
+    await new Promise((r) => setTimeout(r, 150));
+    suppressRecognizer = false;
+    try { handsFreeRecognizer.start(); } catch (_) {}
+  }
 }
 
 // Utility: scroll chat to bottom
@@ -369,6 +401,318 @@ function startContinuousDictation(targetEl, statusEl) {
   };
 }
 
+// LLM router to interpret voice commands into actions (JSON-only)
+async function routeVoiceCommand(transcript, stateSnapshot) {
+  const sys = `You are a voice command router for a hands-free game-rules app.
+- Output strictly JSON and nothing else.
+- Infer the user's intent from their utterance and the current app state.
+- Prefer clear, single-step actions. If you truly need info, ask a short follow-up.
+
+JSON schema:
+{
+  "intent": "ask_referee" | "dictate_rules" | "summarize_rules" | "save_rules" | "select_game" | "delete_game" | "clear_rules" | "export" | "toggle_tts" | "help" | "stop",
+  "say": string,                 // what the assistant should speak to the user (concise)
+  "slots": {
+    "question"?: string,         // for ask_referee
+    "rulesChunk"?: string,       // for dictate_rules
+    "gameName"?: string,         // for save_rules/select_game/delete_game
+    "tts"?: "on" | "off"         // for toggle_tts
+  }
+}`;
+
+  const userContent = [
+    {
+      type: "text",
+      text:
+        `Utterance: "${transcript}"\n` +
+        `STATE JSON:\n` +
+        JSON.stringify(stateSnapshot, null, 2) +
+        `\nRespond strictly with JSON that fits the schema.`,
+    },
+  ];
+
+  const completion = await websim.chat.completions.create({
+    messages: [
+      { role: "system", content: sys },
+      { role: "user", content: userContent, json: true },
+    ],
+  });
+
+  let parsed;
+  try {
+    parsed = JSON.parse(completion.content);
+  } catch {
+    // fallback minimal
+    parsed = { intent: "ask_referee", say: "", slots: { question: transcript } };
+  }
+  parsed.intent = parsed.intent || "ask_referee";
+  parsed.slots = parsed.slots || {};
+  parsed.say = typeof parsed.say === "string" ? parsed.say : "";
+  return parsed;
+}
+
+// Snapshot current app state to help the router
+function getStateSnapshot() {
+  return {
+    hasActiveGame: !!activeGameData,
+    activeGameName: activeGameData?.name || null,
+    savedGames: [],
+    rulesTextLen: (rulesInputEl.value || "").trim().length,
+    ttsEnabled: !!ttsToggle.checked,
+  };
+}
+async function fillSavedGamesInState(state) {
+  const all = await listAllGames();
+  state.savedGames = all.map((g) => g.data?.name || g.id.replace(GAMES_KEY_PREFIX, ""));
+  return state;
+}
+
+// Handle routed action
+async function handleRoutedAction(route) {
+  const { intent, slots, say } = route;
+  if (say) await speakAsync(say);
+
+  switch (intent) {
+    case "dictate_rules": {
+      const chunk = (slots.rulesChunk || "").trim();
+      if (chunk) {
+        rulesInputEl.value = (rulesInputEl.value + "\n" + chunk).trim();
+        handsFreeStatus.textContent = "Captured rules chunk.";
+      } else {
+        await speakAsync("Please dictate the rules details.");
+      }
+      break;
+    }
+    case "summarize_rules": {
+      await summarizeRules();
+      break;
+    }
+    case "save_rules": {
+      let nm = (slots.gameName || gameNameEl.value || "").trim();
+      if (!nm) {
+        await speakAsync("What should I name this game?");
+        // Next user utterance will likely be just the name; we can set a temporary mode.
+        pendingFollowup = { type: "gameNameForSave" };
+      } else {
+        gameNameEl.value = nm;
+        // Try to use the existing summary JSON if visible, otherwise attempt to summarize first
+        if (!summaryContainer.classList.contains("hidden") && summaryPreview.textContent.trim()) {
+          try {
+            const parsed = JSON.parse(summaryPreview.textContent);
+            await saveGameToMemory(parsed);
+          } catch {
+            await summarizeRules();
+            // try again
+            if (summaryPreview.textContent.trim()) {
+              const parsed = JSON.parse(summaryPreview.textContent);
+              await saveGameToMemory(parsed);
+            }
+          }
+        } else {
+          await summarizeRules();
+          if (summaryPreview.textContent.trim()) {
+            const parsed = JSON.parse(summaryPreview.textContent);
+            await saveGameToMemory(parsed);
+          }
+        }
+      }
+      break;
+    }
+    case "select_game": {
+      const all = await listAllGames();
+      const targetName = (slots.gameName || "").toLowerCase();
+      if (!targetName) {
+        await speakAsync("Please say the game name to select.");
+        pendingFollowup = { type: "selectGameName" };
+        break;
+      }
+      const found = all.find((g) => (g.data?.name || "").toLowerCase() === targetName)
+        || all.find((g) => (g.data?.name || "").toLowerCase().includes(targetName));
+      if (found) {
+        await setActiveGame(found.id);
+        await speakAsync(`Now refereeing ${found.data.name}.`);
+      } else {
+        await speakAsync(`I couldn't find ${slots.gameName}.`);
+      }
+      break;
+    }
+    case "delete_game": {
+      if (!slots.gameName && activeGameData) {
+        // Confirm delete active
+        await speakAsync(`Do you want me to delete ${activeGameData.name}? Say confirm to proceed.`);
+        pendingFollowup = { type: "confirmDeleteActive" };
+        break;
+      }
+      const all = await listAllGames();
+      const target = (slots.gameName || "").toLowerCase();
+      const found = all.find((g) => (g.data?.name || "").toLowerCase() === target);
+      if (found) {
+        await del(found.id);
+        await refreshGamesList();
+        await speakAsync(`Deleted ${found.data.name}.`);
+      } else {
+        await speakAsync("I couldn't find that game to delete.");
+      }
+      break;
+    }
+    case "clear_rules": {
+      rulesInputEl.value = "";
+      await speakAsync("Cleared the rules text.");
+      break;
+    }
+    case "export": {
+      await exportAll();
+      await speakAsync("Exported your saved games.");
+      break;
+    }
+    case "toggle_tts": {
+      if (slots.tts === "on") ttsToggle.checked = true;
+      if (slots.tts === "off") ttsToggle.checked = false;
+      await speakAsync(`Text to speech is now ${ttsToggle.checked ? "on" : "off"}.`);
+      break;
+    }
+    case "help": {
+      const help =
+        "You can say: dictate rules, summarize rules, save rules as Game Name, select game Game Name, ask the referee a question, export, or stop.";
+      await speakAsync(help);
+      break;
+    }
+    case "stop": {
+      stopHandsFree();
+      await speakAsync("Hands-free mode stopped.");
+      break;
+    }
+    case "ask_referee":
+    default: {
+      const q = (slots.question || "").trim() || "";
+      if (!q) {
+        await speakAsync("What is your question for the referee?");
+        pendingFollowup = { type: "askRefereeQuestion" };
+        break;
+      }
+      await sendChat(q);
+      break;
+    }
+  }
+}
+
+// Pending follow-ups simple state
+let pendingFollowup = null;
+async function resolvePendingFollowup(text) {
+  const t = (text || "").trim();
+  if (!pendingFollowup) return false;
+  const pf = pendingFollowup;
+  pendingFollowup = null;
+
+  if (pf.type === "gameNameForSave") {
+    gameNameEl.value = t;
+    await speakAsync(`Saving rules as ${t}.`);
+    // proceed to save
+    await handleRoutedAction({ intent: "save_rules", slots: { gameName: t }, say: "" });
+    return true;
+  }
+  if (pf.type === "askRefereeQuestion") {
+    await handleRoutedAction({ intent: "ask_referee", slots: { question: t }, say: "" });
+    return true;
+  }
+  if (pf.type === "selectGameName") {
+    await handleRoutedAction({ intent: "select_game", slots: { gameName: t }, say: "" });
+    return true;
+  }
+  if (pf.type === "confirmDeleteActive") {
+    if (t.toLowerCase().includes("confirm") || t.toLowerCase().includes("yes")) {
+      await deleteActiveGame();
+    } else {
+      await speakAsync("Okay, I will not delete it.");
+    }
+    return true;
+  }
+  return false;
+}
+
+// Hands-free continuous listener
+function startHandsFree() {
+  if (!hasSpeechRecognition) {
+    alert("Speech recognition is not supported in this browser.");
+    return;
+  }
+  if (handsFreeActive) return;
+
+  handsFreeActive = true;
+  handsFreeBtn.textContent = "⏹ Stop Hands-free";
+  handsFreeStatus.textContent = "Listening…";
+  handsFreeRecognizer = new SpeechRecognition();
+  handsFreeRecognizer.lang = "en-US";
+  handsFreeRecognizer.continuous = true;
+  handsFreeRecognizer.interimResults = true;
+
+  let interim = "";
+  handsFreeRecognizer.onstart = () => {
+    if (!suppressRecognizer) handsFreeStatus.textContent = "Listening…";
+  };
+  handsFreeRecognizer.onerror = (e) => {
+    if (!suppressRecognizer) handsFreeStatus.textContent = `Error: ${e.error}`;
+  };
+  handsFreeRecognizer.onend = () => {
+    if (!handsFreeActive) return;
+    if (!suppressRecognizer) {
+      handsFreeStatus.textContent = "Reconnecting…";
+      try { handsFreeRecognizer.start(); } catch (_) {}
+    }
+  };
+  handsFreeRecognizer.onresult = async (event) => {
+    if (suppressRecognizer) return;
+    interim = "";
+    let finalHeard = [];
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const res = event.results[i];
+      if (res.isFinal) {
+        finalHeard.push(res[0].transcript);
+      } else {
+        interim += res[0].transcript;
+      }
+    }
+    if (interim) handsFreeStatus.textContent = `Listening… (${interim})`;
+    if (finalHeard.length > 0) {
+      const transcript = finalHeard.join(" ").trim();
+      if (!transcript) return;
+      renderMsg("user", transcript); // also show in chat log
+      // First, see if it resolves a pending follow-up
+      const handled = await resolvePendingFollowup(transcript);
+      if (handled) return;
+      // Route via LLM
+      const state = await fillSavedGamesInState(getStateSnapshot());
+      try {
+        const route = await routeVoiceCommand(transcript, state);
+        await handleRoutedAction(route);
+      } catch (err) {
+        console.error(err);
+        await speakAsync("I had trouble understanding that. Please try again.");
+      }
+    }
+  };
+
+  try { handsFreeRecognizer.start(); } catch (_) {}
+  // Greeting
+  (async () => {
+    const prompt =
+      activeGameData
+        ? `Hands-free mode is on. You're playing ${activeGameData.name}. Ask the referee or give commands like summarize rules, save rules, or select another game.`
+        : "Hands-free mode is on. Dictate your rules, then say summarize rules, and save rules as followed by a game name.";
+    await speakAsync(prompt);
+  })();
+}
+function stopHandsFree() {
+  handsFreeActive = false;
+  if (handsFreeRecognizer) {
+    try { handsFreeRecognizer.stop(); } catch (_) {}
+    handsFreeRecognizer = null;
+  }
+  handsFreeBtn.textContent = "▶ Hands-free Mode";
+  handsFreeStatus.textContent = "Idle";
+  pendingFollowup = null;
+}
+
 // Export/Import
 async function exportAll() {
   const all = await listAllGames();
@@ -465,6 +809,15 @@ importInput.addEventListener("change", async (e) => {
   }
 });
 
+// Hands-free button
+handsFreeBtn.addEventListener("click", () => {
+  if (handsFreeActive) {
+    stopHandsFree();
+  } else {
+    startHandsFree();
+  }
+});
+
 // Initialize
 (async function init() {
   await refreshGamesList();
@@ -474,4 +827,3 @@ importInput.addEventListener("change", async (e) => {
     "Welcome! Describe a game's rules on the left, then click Summarize & Validate to create a structured rulebook. Save it, select it, and ask me anything as your coach/referee."
   );
 })();
-
